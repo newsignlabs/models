@@ -1,0 +1,89 @@
+name: Publish models
+
+# Builds the model files used by the Offline AI app (newsignlabs/LLM) and publishes them as
+# assets of the public release "models-v1", so phones can download them without a login.
+on:
+  push:
+    branches: ["ccr-53933595-uk1sk7"]
+    paths: [".github/workflows/publish-models.yml", "scripts/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  TAG: models-v1
+  HF: https://huggingface.co
+  SDCPP_COMMIT: 52491bd9f1fc15281791723bdff13baab7fd6819
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download text model and image add-ons
+        run: |
+          mkdir -p out src
+          scripts/fetch.sh out/qwen3-1.7b-q4_k_m.gguf \
+            "$HF/unsloth/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q4_K_M.gguf" \
+            "$HF/bartowski/Qwen_Qwen3-1.7B-GGUF/resolve/main/Qwen_Qwen3-1.7B-Q4_K_M.gguf"
+          scripts/fetch.sh out/lcm-lora-sdv1-5.safetensors \
+            "$HF/latent-consistency/lcm-lora-sdv1-5/resolve/main/pytorch_lora_weights.safetensors"
+          scripts/fetch.sh out/taesd.safetensors \
+            "$HF/madebyollin/taesd/resolve/main/diffusion_pytorch_model.safetensors"
+          scripts/fetch.sh src/sd15.safetensors \
+            "$HF/Comfy-Org/stable-diffusion-v1-5-archive/resolve/main/v1-5-pruned-emaonly-fp16.safetensors" \
+            "$HF/stable-diffusion-v1-5/stable-diffusion-v1-5/resolve/main/v1-5-pruned-emaonly.safetensors"
+
+      - name: Build stable-diffusion.cpp converter
+        run: |
+          git clone https://github.com/leejet/stable-diffusion.cpp sdcpp
+          git -C sdcpp checkout "$SDCPP_COMMIT"
+          git -C sdcpp submodule update --init --depth 1 ggml
+          cmake -S sdcpp -B sdcpp/build -DCMAKE_BUILD_TYPE=Release -DSD_WEBP=OFF -DSD_WEBM=OFF > /dev/null
+          cmake --build sdcpp/build -j "$(nproc)" --target sd-cli
+
+      # Converted here once, so phones skip the slow, memory-hungry conversion step.
+      - name: Convert SD 1.5 to q8_0 GGUF
+        run: |
+          sdcpp/build/bin/sd-cli -M convert -m src/sd15.safetensors -o out/sd15-q8_0.gguf --type q8_0
+          head -c 4 out/sd15-q8_0.gguf | grep -q GGUF
+
+      - name: Licenses and checksums
+        run: |
+          cat > out/LICENSES.md <<'TXT'
+          # Licenses of the published model files
+
+          | File | Source | License |
+          |---|---|---|
+          | qwen3-1.7b-q4_k_m.gguf | Qwen/Qwen3-1.7B (4-bit GGUF) | Apache-2.0 |
+          | sd15-q8_0.gguf | stable-diffusion-v1-5 (converted to q8_0 GGUF, unchanged weights otherwise) | CreativeML OpenRAIL-M, including its use restrictions |
+          | lcm-lora-sdv1-5.safetensors | latent-consistency/lcm-lora-sdv1-5 | OpenRAIL++ |
+          | taesd.safetensors | madebyollin/taesd | MIT |
+
+          The full CreativeML OpenRAIL-M text is in sd15-LICENSE.md.
+          TXT
+          scripts/fetch.sh out/sd15-LICENSE.md \
+            "$HF/Comfy-Org/stable-diffusion-v1-5-archive/resolve/main/LICENSE.md" \
+            "$HF/stable-diffusion-v1-5/stable-diffusion-v1-5/resolve/main/LICENSE.md" \
+            "https://raw.githubusercontent.com/CompVis/stable-diffusion/main/LICENSE" || echo "license text not fetched"
+          cd out
+          sha256sum *.gguf *.safetensors > SHA256SUMS
+          python3 - <<'PY'
+          import hashlib, json, os
+          sums = dict(reversed(l.split()) for l in open("SHA256SUMS"))
+          manifest = {n: {"size_bytes": os.path.getsize(n), "sha256": sums[n]} for n in sorted(sums)}
+          json.dump(manifest, open("manifest.json", "w"), indent=2)
+          print(json.dumps(manifest, indent=2))
+          PY
+          ls -l
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete "$TAG" --yes --cleanup-tag || true
+          gh release create "$TAG" out/* --target "$GITHUB_SHA" --title "Models v1" \
+            --notes "Model files for the Offline AI app. See LICENSES.md. Checksums in SHA256SUMS / manifest.json."
